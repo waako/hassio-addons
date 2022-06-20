@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 set -e
 
@@ -14,6 +14,7 @@ SHOW_SERVER_LOGS="${SHOW_SERVER_LOGS:-true}"
 SHOW_MONGODB_LOGS="${SHOW_MONGODB_LOGS:-false}"
 SSL_CERT_NAME="${SSL_CERT_NAME:-tls.crt}"
 SSL_KEY_NAME="${SSL_KEY_NAME:-tls.key}"
+TLS_1_11_ENABLED="${TLS_1_11_ENABLED:-false}"
 
 # set default time zone and notify user of time zone
 echo "INFO: Time zone set to '${TZ}'"
@@ -26,21 +27,15 @@ then
 fi
 
 set_port_property() {
-  if [ -f "/opt/tplink/EAPController/data/db/storage.bson" ]
+  # check to see if we are trying to bind to privileged port
+  if [ "${3}" -lt "1024" ] && [ "$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)" = "1024" ]
   then
-    echo "WARNING: Unable to change '${1}' to ${3} after initial run; change the ports via the web UI"
-  else
-
-    # check to see if we are trying to bind to privileged port
-    if [ "${3}" -lt "1024" ] && [ "$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)" = "1024" ]
-    then
-      echo "ERROR: Unable to set '${1}' to $3; 'ip_unprivileged_port_start' has not been set.  See https://github.com/mbentley/docker-omada-controller#unprivileged-ports"
-      exit 1
-    fi
-
-    echo "INFO: Setting '${1}' to ${3}"
-    sed -i "s/^${1}=${2}$/${1}=${3}/g" /opt/tplink/EAPController/properties/omada.properties
+    echo "ERROR: Unable to set '${1}' to ${3}; 'ip_unprivileged_port_start' has not been set.  See https://github.com/mbentley/docker-omada-controller#unprivileged-ports"
+    exit 1
   fi
+
+  echo "INFO: Setting '${1}' to ${3} in omada.properties"
+  sed -i "s/^${1}=${2}$/${1}=${3}/g" /opt/tplink/EAPController/properties/omada.properties
 }
 
 # replace MANAGE_HTTP_PORT if not the default
@@ -67,17 +62,8 @@ then
   set_port_property portal.https.port 8843 "${PORTAL_HTTPS_PORT}"
 fi
 
-# check to see if there is a db directory; create it if it is missing
-if [ ! -d "/data/omada_controller" ]
-then
-  echo "INFO: Omanda Controller directory missing; creating '/data/omada_controller'"
-  mkdir /data/omada_controller
-  chown 508:508 /data/omada_controller
-  echo "done"
-fi
-
 # make sure permissions are set appropriately on each directory
-for DIR in work logs
+for DIR in data work logs
 do
   OWNER="$(stat -c '%u' /opt/tplink/EAPController/${DIR})"
   GROUP="$(stat -c '%g' /opt/tplink/EAPController/${DIR})"
@@ -91,46 +77,86 @@ do
   fi
 done
 
-# check to see if there is a data & db directory; create it if it is missing
-if [ ! -d "/data/omada_controller/data" ]
+# validate permissions on /tmp
+TMP_PERMISSIONS="$(stat -c '%a' /tmp)"
+if [ "${TMP_PERMISSIONS}" != "1777" ]
 then
-  echo "INFO: Database directory missing; creating '/data/omada_controller/data'"
-  mkdir /data/omada_controller/data
-  mkdir /data/omada_controller/data/db
-  chown 508:508 /data/omada_controller/data
-  chown 508:508 /data/omada_controller/data/db
+  echo "WARNING: permissions are not set correctly on '/tmp' (${TMP_PERMISSIONS})!"
+  echo "INFO: setting correct permissions (1777)"
+  chmod -v 1777 /tmp
+fi
+
+# check to see if there is a db directory; create it if it is missing
+if [ ! -d "/opt/tplink/EAPController/data/db" ]
+then
+  echo "INFO: Database directory missing; creating '/opt/tplink/EAPController/data/db'"
+  mkdir /opt/tplink/EAPController/data/db
+  chown 508:508 /opt/tplink/EAPController/data/db
   echo "done"
 fi
 
-# Import a cert from a possibly mounted secret or file at /ssl
-if [ -f "/ssl/${SSL_KEY_NAME}" ] && [ -f "/ssl/${SSL_CERT_NAME}" ]
+# Import a cert from a possibly mounted secret or file at /cert
+if [ -f "/cert/${SSL_KEY_NAME}" ] && [ -f "/cert/${SSL_CERT_NAME}" ]
 then
-  echo "INFO: Importing Cert "
+  # see where the keystore directory is; check for old location first
+  if [ -d /opt/tplink/EAPController/keystore ]
+  then
+    # keystore in the parent folder before 5.3.1
+    KEYSTORE_DIR="/opt/tplink/EAPController/keystore"
+  else
+    # keystore directory moved to the data directory in 5.3.1
+    KEYSTORE_DIR="/opt/tplink/EAPController/data/keystore"
+
+    # check to see if the KEYSTORE_DIR exists (it won't on upgrade)
+    if [ ! -d "${KEYSTORE_DIR}" ]
+    then
+      echo "INFO: creating keystore directory (${KEYSTORE_DIR})"
+      mkdir "${KEYSTORE_DIR}"
+      echo "INFO: setting permissions on ${KEYSTORE_DIR}"
+      chown 508:508 "${KEYSTORE_DIR}"
+    fi
+  fi
+
+  echo "INFO: Importing cert from /cert/tls.[key|crt]"
+  # delete the existing keystore
+  rm -f "${KEYSTORE_DIR}/eap.keystore"
+
   # example certbot usage: ./certbot-auto certonly --standalone --preferred-challenges http -d mydomain.net
   openssl pkcs12 -export \
-    -inkey "/ssl/${SSL_KEY_NAME}" \
-    -in "/ssl/${SSL_CERT_NAME}" \
-    -certfile "/ssl/${SSL_CERT_NAME}" \
+    -inkey "/cert/${SSL_KEY_NAME}" \
+    -in "/cert/${SSL_CERT_NAME}" \
+    -certfile "/cert/${SSL_CERT_NAME}" \
     -name eap \
-    -out /opt/tplink/EAPController/keystore/cert.p12 \
+    -out "${KEYSTORE_DIR}/eap.keystore" \
     -passout pass:tplink
 
-  # delete the existing keystore
-  rm /opt/tplink/EAPController/keystore/eap.keystore
-  keytool -importkeystore \
-    -deststorepass tplink \
-    -destkeystore /opt/tplink/EAPController/keystore/eap.keystore \
-    -srckeystore /opt/tplink/EAPController/keystore/cert.p12 \
-    -srcstoretype PKCS12 \
-    -srcstorepass tplink
+  # set ownership/permission on keystore
+  chown omada:omada "${KEYSTORE_DIR}/eap.keystore"
+  chmod 400 "${KEYSTORE_DIR}/eap.keystore"
+fi
+
+# re-enable disabled TLS versions 1.0 & 1.1
+if [ "${TLS_1_11_ENABLED}" = "true" ]
+then
+  echo "INFO: Re-enabling TLS 1.0 & 1.1"
+  sed -i 's#^jdk.tls.disabledAlgorithms=SSLv3, TLSv1, TLSv1.1,#jdk.tls.disabledAlgorithms=SSLv3,#' /etc/java-8-openjdk/security/java.security
 fi
 
 # see if any of these files exist; if so, do not start as they are from older versions
-if [ -f /data/omada_controller/data/db/tpeap.0 ] || [ -f /data/omada_controller/data/db/tpeap.1 ] || [ -f /data/omada_controller/data/db/tpeap.ns ]
+if [ -f /opt/tplink/EAPController/data/db/tpeap.0 ] || [ -f /opt/tplink/EAPController/data/db/tpeap.1 ] || [ -f /opt/tplink/EAPController/data/db/tpeap.ns ]
 then
-  echo "ERROR: the data volume mounted to /data/omada_controller/data appears to have data from a previous version!"
+  echo "ERROR: the data volume mounted to /opt/tplink/EAPController/data appears to have data from a previous version!"
   echo "  Follow the upgrade instructions at https://github.com/mbentley/docker-omada-controller#upgrading-to-41"
   exit 1
+fi
+
+# check to see if the CMD passed contains the text "com.tplink.omada.start.OmadaLinuxMain" which is the old classpath from 4.x
+if [ "$(echo "${@}" | grep -q "com.tplink.omada.start.OmadaLinuxMain"; echo $?)" = "0" ]
+then
+  echo -e "\n############################"
+  echo "WARNING: CMD from 4.x detected!  It is likely that this container will fail to start properly with a \"Could not find or load main class com.tplink.omada.start.OmadaLinuxMain\" error!"
+  echo "  See the note on old CMDs at https://github.com/mbentley/docker-omada-controller/blob/master/KNOWN_ISSUES.md#upgrade-issues for details on why and how to resolve the issue."
+  echo -e "############################\n"
 fi
 
 echo "INFO: Starting Omada Controller as user omada"
