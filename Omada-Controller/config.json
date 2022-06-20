@@ -23,8 +23,8 @@
         "29812/udp": 29812,
         "29813/tcp": 29813,
         "29813/udp": 29813,
-        "29813/tcp": 29814,
-        "29813/udp": 29814
+        "29814/tcp": 29814,
+        "29814/udp": 29814
     },
     "ports_description": {
         "8088/tcp": "Used for Omada Controller interface and API",
